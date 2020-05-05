@@ -1,15 +1,13 @@
-import asyncio
-import struct
 import time
+import struct
 import socket
+import asyncio
 import logging
 
 from io import BytesIO
 from abc import ABC, abstractmethod
-from typing import Optional, List, Tuple, Dict, NamedTuple, Callable
-from typing import cast, TYPE_CHECKING
-from asyncio import Transport, Protocol, Event, BaseTransport, TimerHandle
-from asyncio import Queue
+from typing import Optional, List, Tuple, Dict, NamedTuple, Callable, Deque
+from typing import cast, FrozenSet
 from functools import partial
 from collections import deque
 
@@ -27,11 +25,6 @@ from h2.exceptions import ProtocolError, TooManyStreamsError, StreamClosedError
 from .utils import Wrapper
 from .config import Configuration
 from .exceptions import StreamTerminatedError
-
-
-if TYPE_CHECKING:
-    from typing import Deque
-
 
 try:
     from h2.events import PingReceived, PingAckReceived
@@ -74,7 +67,7 @@ class Buffer:
     def __init__(self, ack_callback: Callable[[int], None]) -> None:
         self._ack_callback = ack_callback
         self._eof = False
-        self._unacked: 'Queue[UnackedData]' = Queue()
+        self._unacked: 'asyncio.Queue[UnackedData]' = asyncio.Queue()
         self._acked: 'Deque[AckedData]' = deque()
         self._acked_size = 0
 
@@ -135,7 +128,7 @@ class StreamsLimit:
     def __init__(self, limit: Optional[int] = None) -> None:
         self._limit = limit
         self._current = 0
-        self._release = Event()
+        self._release = asyncio.Event()
 
     def reached(self) -> bool:
         if self._limit is not None:
@@ -162,6 +155,46 @@ class StreamsLimit:
         self._limit = value
 
 
+class Transport:
+    """
+    Represents an information about a connection
+    """
+    def __init__(self, transport: asyncio.Transport) -> None:
+        self._transport = transport
+
+    @property
+    def secure(self) -> bool:
+        return self._transport.get_extra_info('ssl_object') is not None
+
+    def peer_cert(self) -> Optional[bytes]:
+        ssl_object = self._transport.get_extra_info('ssl_object')
+        if ssl_object is not None:
+            return ssl_object.getpeercert()  # type: ignore
+        else:
+            return None
+
+    def peer_names(self) -> 'FrozenSet[str]':
+        ssl_object = self._transport.get_extra_info('ssl_object')
+        if ssl_object is None:
+            return frozenset()
+        cert = ssl_object.getpeercert()
+        if not cert:
+            return frozenset()
+        names = []
+        for key, value in cert.get('subjectAltName', ()):
+            if key == 'DNS' or key == 'IP Address':
+                names.append(value)
+        if not names:
+            for sub in cert.get('subject', ()):
+                for key, value in sub:
+                    if key == 'commonName':
+                        names.append(value)
+        return frozenset(names)
+
+    def peer_addr(self) -> Optional[Tuple[str, int]]:
+        return self._transport.get_extra_info('peername')  # type: ignore
+
+
 class Connection:
     """
     Holds connection state (write_ready), and manages
@@ -182,13 +215,13 @@ class Connection:
     last_message_received: Optional[float] = None
     last_ping_sent: Optional[float] = None
     ping_count_in_sequence: int = 0
-    _ping_handle: Optional[TimerHandle] = None
-    _close_by_ping_handler: Optional[TimerHandle] = None
+    _ping_handle: Optional[asyncio.TimerHandle] = None
+    _close_by_ping_handler: Optional[asyncio.TimerHandle] = None
 
     def __init__(
         self,
         connection: H2Connection,
-        transport: Transport,
+        transport: asyncio.Transport,
         *,
         config: Configuration,
     ) -> None:
@@ -196,10 +229,13 @@ class Connection:
         self._transport = transport
         self._config = config
 
-        self.write_ready = Event()
+        self.write_ready = asyncio.Event()
         self.write_ready.set()
 
-        self.stream_close_waiter = Event()
+        self.stream_close_waiter = asyncio.Event()
+
+    def get_transport(self) -> Transport:
+        return Transport(self._transport)
 
     def feed(self, data: bytes) -> List[H2Event]:
         return self._connection.receive_data(data)  # type: ignore
@@ -318,7 +354,7 @@ class Stream:
         self,
         connection: Connection,
         h2_connection: H2Connection,
-        transport: Transport,
+        transport: asyncio.Transport,
         *,
         stream_id: Optional[int] = None,
         wrapper: Optional[Wrapper] = None
@@ -331,11 +367,11 @@ class Stream:
         if stream_id is not None:
             self.init_stream(stream_id, self.connection)
 
-        self.window_updated = Event()
+        self.window_updated = asyncio.Event()
         self.headers: Optional['_Headers'] = None
-        self.headers_received = Event()
+        self.headers_received = asyncio.Event()
         self.trailers: Optional['_Headers'] = None
-        self.trailers_received = Event()
+        self.trailers_received = asyncio.Event()
 
     def init_stream(self, stream_id: int, connection: Connection) -> None:
         self.id = stream_id
@@ -671,7 +707,7 @@ class EventsProcessor:
         self.connection.ping_ack_process()
 
 
-class H2Protocol(Protocol):
+class H2Protocol(asyncio.Protocol):
     connection: Connection
     processor: EventsProcessor
 
@@ -685,7 +721,7 @@ class H2Protocol(Protocol):
         self.config = config
         self.h2_config = h2_config
 
-    def connection_made(self, transport: BaseTransport) -> None:
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
         sock = transport.get_extra_info('socket')
         if sock is not None:
             _set_nodelay(sock)
@@ -695,7 +731,7 @@ class H2Protocol(Protocol):
 
         self.connection = Connection(
             h2_conn,
-            cast(Transport, transport),
+            cast(asyncio.Transport, transport),
             config=self.config,
         )
         self.connection.flush()

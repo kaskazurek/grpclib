@@ -97,6 +97,8 @@ class Stream(StreamIterator[_RecvType], Generic[_RecvType, _SendType]):
         #: Invocation metadata, received with headers from the client.
         #: Represented as a multi-dict object.
         self.metadata: Optional[_Metadata] = None
+        #: Transport data
+        self.transport = self._stream.connection.get_transport()
 
     @property
     def _content_type(self) -> str:
